@@ -1,0 +1,226 @@
+name: Project Sync (Reusable)
+
+on:
+  workflow_call:
+    secrets:
+      PROJECT_SYNC_APP_ID:
+        required: true
+      PROJECT_SYNC_APP_PRIVATE_KEY:
+        required: true
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  sync-project:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.PROJECT_SYNC_APP_ID }}
+          private-key: ${{ secrets.PROJECT_SYNC_APP_PRIVATE_KEY }}
+          owner: ligue-lead-tech
+
+      - name: Sync PR status to Project
+        if: steps.app-token.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const PROJECT_NUMBER = 12;
+            const ORG = 'ligue-lead-tech';
+            const PROJECT_ID = 'PVT_kwDOBpMd-c4Bbvuy';
+            const STATUS_FIELD_ID = 'PVTSSF_lADOBpMd-c4BbvuyzhWeC1A';
+
+            const STATUS = {
+              IN_REVIEW: 'a2626cf8',
+              TESTING: '57fb87cf',
+              DONE: '336b0f7a'
+            };
+
+            const OWNERS = ['joaosanches', 'luizramosdev'];
+
+            const event = context.eventName;
+            const pr = context.payload.pull_request;
+
+            if (!pr) {
+              console.log('No PR in context, skipping.');
+              return;
+            }
+
+            const body = pr.body || '';
+            const issueMatch = body.match(/closes?\s+#(\d+)/i) || body.match(/fix(?:es)?\s+#(\d+)/i);
+            if (!issueMatch) {
+              console.log('No linked issue found in PR body. Skipping.');
+              return;
+            }
+            const issueNumber = parseInt(issueMatch[1]);
+            console.log(`Linked issue: #${issueNumber}`);
+
+            // Auto-assign PR author to linked issue
+            if (event === 'pull_request' && context.payload.action === 'ready_for_review') {
+              try {
+                await github.rest.issues.addAssignees({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  assignees: [pr.user.login]
+                });
+                console.log(`Assigned @${pr.user.login} to issue #${issueNumber}`);
+              } catch (e) { console.log(`Could not assign: ${e.message}`); }
+            }
+
+            let targetStatus = null;
+            let action = '';
+            let deployToHomolog = false;
+
+            if (event === 'pull_request' && context.payload.action === 'ready_for_review') {
+              targetStatus = STATUS.IN_REVIEW;
+              action = 'Ready for Review → In Review';
+            }
+
+            if (event === 'pull_request' && context.payload.action === 'closed' && pr.merged) {
+              targetStatus = STATUS.DONE;
+              action = 'PR Merged → Done';
+            }
+
+            if (event === 'pull_request_review' && context.payload.review?.state === 'approved') {
+              const reviewer = context.payload.review.user.login;
+
+              if (OWNERS.includes(reviewer)) {
+                targetStatus = STATUS.TESTING;
+                deployToHomolog = true;
+                action = `Owner @${reviewer} approved → Testing`;
+              } else {
+                const { data: reviews } = await github.rest.pulls.listReviews({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number
+                });
+                const uniqueApprovals = [...new Set(
+                  reviews.filter(r => r.state === 'APPROVED').map(r => r.user.login)
+                )];
+                if (uniqueApprovals.length >= 2) {
+                  targetStatus = STATUS.TESTING;
+                  deployToHomolog = true;
+                  action = `2+ approvals → Testing`;
+                }
+              }
+            }
+
+            if (!targetStatus) {
+              console.log('No status change needed.');
+              return;
+            }
+
+            console.log(`Action: ${action}`);
+
+            // Deploy to homolog: merge PR branch into homolog (if branch exists)
+            if (deployToHomolog) {
+              try {
+                // Check if homolog branch exists
+                await github.rest.repos.getBranch({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  branch: 'homolog'
+                });
+                await github.rest.repos.merge({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  base: 'homolog',
+                  head: pr.head.ref,
+                  commit_message: `deploy(homolog): ${pr.title} (#${pr.number})`
+                });
+                console.log(`✅ Merged ${pr.head.ref} into homolog`);
+              } catch (e) {
+                if (e.status === 404) {
+                  console.log('No homolog branch in this repo. Skipping deploy.');
+                } else {
+                  console.log(`⚠️ Failed to merge into homolog: ${e.message}`);
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.number,
+                    body: `## ⚠️ Conflito ao deployar em homologação\n\nNão foi possível fazer merge automático da branch \`${pr.head.ref}\` na \`homolog\`.\n\n**Ação necessária:** resolva o conflito manualmente:\n\`\`\`bash\ngit checkout homolog\ngit pull origin homolog\ngit merge origin/${pr.head.ref}\n# resolva conflitos\ngit push origin homolog\n\`\`\`\n\nApós resolver, o deploy será disparado automaticamente.`
+                  });
+                }
+              }
+            }
+
+            // Search for the issue item in the project
+            const query = `
+              query($projectId: ID!, $cursor: String) {
+                node(id: $projectId) {
+                  ... on ProjectV2 {
+                    items(first: 100, after: $cursor) {
+                      nodes {
+                        id
+                        content {
+                          ... on Issue {
+                            number
+                            repository { name }
+                          }
+                        }
+                      }
+                      pageInfo { hasNextPage endCursor }
+                    }
+                  }
+                }
+              }
+            `;
+
+            let projectItem = null;
+            let cursor = null;
+
+            while (!projectItem) {
+              const result = await github.graphql(query, {
+                projectId: PROJECT_ID,
+                cursor: cursor
+              });
+
+              const items = result.node?.items?.nodes || [];
+              projectItem = items.find(i =>
+                i.content?.number === issueNumber &&
+                i.content?.repository?.name === context.repo.repo
+              );
+
+              if (!projectItem && result.node?.items?.pageInfo?.hasNextPage) {
+                cursor = result.node.items.pageInfo.endCursor;
+              } else {
+                break;
+              }
+            }
+
+            if (!projectItem) {
+              console.log(`Issue #${issueNumber} not found in Project. Skipping.`);
+              return;
+            }
+
+            console.log(`Found item: ${projectItem.id}`);
+
+            const mutation = `
+              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: $projectId
+                  itemId: $itemId
+                  fieldId: $fieldId
+                  value: { singleSelectOptionId: $optionId }
+                }) {
+                  projectV2Item { id }
+                }
+              }
+            `;
+
+            await github.graphql(mutation, {
+              projectId: PROJECT_ID,
+              itemId: projectItem.id,
+              fieldId: STATUS_FIELD_ID,
+              optionId: targetStatus
+            });
+
+            console.log(`✅ ${action}`);
