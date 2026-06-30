@@ -1,0 +1,16 @@
+# Copie este arquivo para .github/workflows/project-sync.yml no seu repositório.
+# Isso integra o repo ao board Tech (https://github.com/orgs/ligue-lead-tech/projects/12).
+# Nenhuma configuração adicional é necessária.
+
+name: Sync PR to Project Board
+
+on:
+  pull_request:
+    types: [ready_for_review, closed]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  sync:
+    uses: ligue-lead-tech/.github/.github/workflows/project-sync-reusable.yml@main
+    secrets: inherit
