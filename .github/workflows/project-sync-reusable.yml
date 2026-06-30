@@ -32,8 +32,13 @@ jobs:
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
+            // --- Config: defaults ---
+            const DEFAULTS = {
+              deploy_branch: 'homolog',
+              owners: ['joaosanches', 'luizramosdev']
+            };
+
             const PROJECT_NUMBER = 12;
-            const ORG = 'ligue-lead-tech';
             const PROJECT_ID = 'PVT_kwDOBpMd-c4Bbvuy';
             const STATUS_FIELD_ID = 'PVTSSF_lADOBpMd-c4BbvuyzhWeC1A';
 
@@ -44,8 +49,29 @@ jobs:
               DONE: '336b0f7a'
             };
 
-            const OWNERS = ['joaosanches', 'luizramosdev'];
+            // --- Load repo config (.github/project-sync.json) ---
+            let config = { ...DEFAULTS };
+            try {
+              const { data } = await github.rest.repos.getContent({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                path: '.github/project-sync.json'
+              });
+              const parsed = JSON.parse(Buffer.from(data.content, 'base64').toString());
+              config = { ...DEFAULTS, ...parsed };
+              console.log(`Config loaded: ${JSON.stringify(config)}`);
+            } catch (e) {
+              if (e.status === 404) {
+                console.log('No .github/project-sync.json found. Using defaults.');
+              } else {
+                console.log(`⚠️ Error loading config: ${e.message}. Using defaults.`);
+              }
+            }
 
+            const OWNERS = config.owners;
+            const DEPLOY_BRANCH = config.deploy_branch;
+
+            // --- Event handling ---
             const event = context.eventName;
             const pr = context.payload.pull_request;
 
@@ -126,35 +152,37 @@ jobs:
 
             console.log(`Action: ${action}`);
 
-            // Deploy to homolog: merge PR branch into homolog (if branch exists)
-            if (deployToHomolog) {
+            // Deploy: merge PR branch into deploy branch
+            if (deployToHomolog && DEPLOY_BRANCH) {
               try {
                 await github.rest.repos.getBranch({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  branch: 'homolog'
+                  branch: DEPLOY_BRANCH
                 });
                 await github.rest.repos.merge({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  base: 'homolog',
+                  base: DEPLOY_BRANCH,
                   head: pr.head.ref,
-                  commit_message: `deploy(homolog): ${pr.title} (#${pr.number})`
+                  commit_message: `deploy(${DEPLOY_BRANCH}): ${pr.title} (#${pr.number})`
                 });
-                console.log(`✅ Merged ${pr.head.ref} into homolog`);
+                console.log(`✅ Merged ${pr.head.ref} into ${DEPLOY_BRANCH}`);
               } catch (e) {
                 if (e.status === 404) {
-                  console.log('No homolog branch in this repo. Skipping deploy.');
+                  console.log(`No '${DEPLOY_BRANCH}' branch in this repo. Skipping deploy.`);
                 } else {
-                  console.log(`⚠️ Failed to merge into homolog: ${e.message}`);
+                  console.log(`⚠️ Failed to merge into ${DEPLOY_BRANCH}: ${e.message}`);
                   await github.rest.issues.createComment({
                     owner: context.repo.owner,
                     repo: context.repo.repo,
                     issue_number: pr.number,
-                    body: `## ⚠️ Conflito ao deployar em homologação\n\nNão foi possível fazer merge automático da branch \`${pr.head.ref}\` na \`homolog\`.\n\n**Ação necessária:** resolva o conflito manualmente:\n\`\`\`bash\ngit checkout homolog\ngit pull origin homolog\ngit merge origin/${pr.head.ref}\n# resolva conflitos\ngit push origin homolog\n\`\`\`\n\nApós resolver, o deploy será disparado automaticamente.`
+                    body: `## ⚠️ Conflito ao deployar em ${DEPLOY_BRANCH}\n\nNão foi possível fazer merge automático da branch \`${pr.head.ref}\` na \`${DEPLOY_BRANCH}\`.\n\n**Ação necessária:** resolva o conflito manualmente:\n\`\`\`bash\ngit checkout ${DEPLOY_BRANCH}\ngit pull origin ${DEPLOY_BRANCH}\ngit merge origin/${pr.head.ref}\n# resolva conflitos\ngit push origin ${DEPLOY_BRANCH}\n\`\`\`\n\nApós resolver, o deploy será disparado automaticamente.`
                   });
                 }
               }
+            } else if (deployToHomolog && !DEPLOY_BRANCH) {
+              console.log('Deploy branch is null/disabled in config. Skipping deploy.');
             }
 
             // Search for the issue item in the project
