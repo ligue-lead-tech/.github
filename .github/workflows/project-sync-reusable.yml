@@ -38,6 +38,7 @@ jobs:
             const STATUS_FIELD_ID = 'PVTSSF_lADOBpMd-c4BbvuyzhWeC1A';
 
             const STATUS = {
+              IN_PROGRESS: 'd0c06cbf',
               IN_REVIEW: 'a2626cf8',
               TESTING: '57fb87cf',
               DONE: '336b0f7a'
@@ -84,6 +85,11 @@ jobs:
               action = 'Ready for Review → In Review';
             }
 
+            if (event === 'pull_request' && context.payload.action === 'converted_to_draft') {
+              targetStatus = STATUS.IN_PROGRESS;
+              action = 'Converted to Draft → In Progress';
+            }
+
             if (event === 'pull_request' && context.payload.action === 'closed' && pr.merged) {
               targetStatus = STATUS.DONE;
               action = 'PR Merged → Done';
@@ -123,7 +129,6 @@ jobs:
             // Deploy to homolog: merge PR branch into homolog (if branch exists)
             if (deployToHomolog) {
               try {
-                // Check if homolog branch exists
                 await github.rest.repos.getBranch({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
