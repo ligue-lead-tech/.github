@@ -19,7 +19,7 @@ jobs:
     steps:
       - name: Generate App Token
         id: app-token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v2
         continue-on-error: true
         with:
           app-id: ${{ secrets.PROJECT_SYNC_APP_ID }}
@@ -208,6 +208,7 @@ jobs:
 
             console.log(`Found item: ${projectItem.id}`);
 
+            // Update status with retry (GitHub GraphQL can return transient 500s)
             const mutation = `
               mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
                 updateProjectV2ItemFieldValue(input: {
@@ -221,11 +222,23 @@ jobs:
               }
             `;
 
-            await github.graphql(mutation, {
-              projectId: PROJECT_ID,
-              itemId: projectItem.id,
-              fieldId: STATUS_FIELD_ID,
-              optionId: targetStatus
-            });
-
-            console.log(`✅ ${action}`);
+            const maxRetries = 3;
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+              try {
+                await github.graphql(mutation, {
+                  projectId: PROJECT_ID,
+                  itemId: projectItem.id,
+                  fieldId: STATUS_FIELD_ID,
+                  optionId: targetStatus
+                });
+                console.log(`✅ ${action}`);
+                break;
+              } catch (e) {
+                if (attempt < maxRetries && (e.status >= 500 || e.message?.includes('fetch failed'))) {
+                  console.log(`⚠️ Attempt ${attempt} failed (${e.message}). Retrying in 3s...`);
+                  await new Promise(r => setTimeout(r, 3000));
+                } else {
+                  throw e;
+                }
+              }
+            }
